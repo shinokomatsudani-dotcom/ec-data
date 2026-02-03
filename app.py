@@ -18,6 +18,7 @@ import os
 
 # 自作モジュール
 from processing import run_full_pipeline, ProcessingLog
+from data_gen import generate_template_csv, get_required_columns, get_optional_columns, main as generate_demo_data
 
 # ページ設定
 st.set_page_config(
@@ -79,9 +80,82 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+def validate_uploaded_data(df: pd.DataFrame) -> dict:
+    """
+    アップロードされたデータのバリデーション
+
+    Returns:
+        dict: {
+            "is_valid": bool,
+            "missing_required": list,  # 不足している必須カラム
+            "missing_optional": list,  # 不足しているオプションカラム
+            "warnings": list,          # 警告メッセージ
+            "errors": list             # エラーメッセージ
+        }
+    """
+    required_columns = get_required_columns()
+    optional_columns = get_optional_columns()
+
+    result = {
+        "is_valid": True,
+        "missing_required": [],
+        "missing_optional": [],
+        "warnings": [],
+        "errors": []
+    }
+
+    # 必須カラムのチェック
+    for col in required_columns:
+        if col not in df.columns:
+            result["missing_required"].append(col)
+            result["is_valid"] = False
+
+    # オプションカラムのチェック
+    for col in optional_columns:
+        if col not in df.columns:
+            result["missing_optional"].append(col)
+
+    # エラーメッセージ生成
+    if result["missing_required"]:
+        result["errors"].append(
+            f"必須カラムが不足しています: {', '.join(result['missing_required'])}"
+        )
+
+    # 警告メッセージ生成
+    if result["missing_optional"]:
+        result["warnings"].append(
+            f"オプションカラムが不足しています（一部の分析が制限される可能性があります）: {', '.join(result['missing_optional'])}"
+        )
+
+    # データ量のチェック
+    if len(df) == 0:
+        result["is_valid"] = False
+        result["errors"].append("データが空です。1件以上のデータをアップロードしてください。")
+
+    # 基本的なデータ品質チェック
+    if result["is_valid"]:
+        # order_dateのチェック
+        if "order_date" in df.columns:
+            null_dates = df["order_date"].isna().sum()
+            if null_dates > len(df) * 0.5:
+                result["warnings"].append(
+                    f"order_dateの欠損が多いです（{null_dates}件/{len(df)}件）。日付の分析精度に影響します。"
+                )
+
+        # total_amountのチェック
+        if "total_amount" in df.columns:
+            null_amounts = df["total_amount"].isna().sum()
+            if null_amounts > len(df) * 0.3:
+                result["warnings"].append(
+                    f"total_amountの欠損が多いです（{null_amounts}件/{len(df)}件）。"
+                )
+
+    return result
+
+
 @st.cache_data
-def load_and_process_data():
-    """データの読み込みと処理（キャッシュ）"""
+def load_demo_data():
+    """デモ用データの読み込みと処理（キャッシュ）"""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     raw_data_path = os.path.join(script_dir, "raw_data.csv")
 
@@ -89,6 +163,23 @@ def load_and_process_data():
         return None
 
     return run_full_pipeline(raw_data_path)
+
+
+def process_uploaded_data(df: pd.DataFrame):
+    """アップロードされたデータを処理"""
+    import tempfile
+
+    # 一時ファイルに保存してパイプラインを実行
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False, encoding='utf-8-sig') as f:
+        df.to_csv(f, index=False)
+        temp_path = f.name
+
+    try:
+        results = run_full_pipeline(temp_path)
+        return results
+    finally:
+        # 一時ファイルを削除
+        os.unlink(temp_path)
 
 
 def render_header():
@@ -538,126 +629,394 @@ def render_insights_tab(results: dict):
 
 
 def render_action_tab(results: dict):
-    """Action タブ: ビジネスアクション提言"""
+    """Action タブ: ビジネスアクション提言（データに応じて動的に生成）"""
     st.header("アクションプラン")
-    st.markdown("分析結果に基づく具体的なビジネスアクションを提案します。")
+    st.markdown("**このデータから導かれた**具体的なビジネスアクションを提案します。")
 
     insights = results["insights"]
     rfm_df = results["rfm_df"]
     ltv_df = results["ltv_df"]
 
-    # インサイトカード
-    for insight in insights:
-        card_class = "warning-card" if insight["type"] == "warning" else "action-card"
-        icon = "⚠️" if insight["type"] == "warning" else "💡"
+    # セグメント別顧客数を取得
+    segment_counts = rfm_df["segment"].value_counts().to_dict() if len(rfm_df) > 0 else {}
 
-        st.markdown(f"""
-        <div class="{card_class}">
-            <h4>{icon} {insight['title']}</h4>
-            <p>{insight['detail']}</p>
-            <p><strong>推奨アクション:</strong> {insight['action']}</p>
-        </div>
-        """, unsafe_allow_html=True)
+    # ========================================================================
+    # インサイトカード（動的に生成されたもの）
+    # ========================================================================
+    st.subheader("優先アクション")
 
-    st.divider()
+    if len(insights) == 0:
+        st.info("分析データが不足しているため、アクション提案を生成できません。")
+    else:
+        for i, insight in enumerate(insights):
+            # タイプに応じたスタイル
+            if insight["type"] == "warning":
+                card_class = "warning-card"
+                icon = "⚠️"
+                priority_badge = "🔴 緊急"
+            elif insight["type"] == "info":
+                card_class = "insight-card"
+                icon = "ℹ️"
+                priority_badge = "⚪ 情報"
+            else:
+                card_class = "action-card"
+                icon = "💡"
+                priority = insight.get("priority", 3)
+                if priority <= 2:
+                    priority_badge = "🟠 重要"
+                else:
+                    priority_badge = "🟢 推奨"
 
-    # 優先度マトリクス
-    st.subheader("施策優先度マトリクス")
-
-    actions = [
-        {"施策": "離反リスク顧客へのリテンションメール", "効果": 4, "工数": 2, "優先度": "高"},
-        {"施策": "VIP顧客向け特別プログラム", "効果": 5, "工数": 4, "優先度": "高"},
-        {"施策": "休眠顧客への復帰キャンペーン", "効果": 3, "工数": 2, "優先度": "中"},
-        {"施策": "初回購入者への日用品推奨", "効果": 4, "工数": 3, "優先度": "高"},
-        {"施策": "データ品質モニタリング自動化", "効果": 3, "工数": 5, "優先度": "低"},
-    ]
-
-    actions_df = pd.DataFrame(actions)
-
-    fig = px.scatter(
-        actions_df,
-        x="工数",
-        y="効果",
-        size=[40] * len(actions_df),
-        text="施策",
-        color="優先度",
-        color_discrete_map={"高": "#10b981", "中": "#f59e0b", "低": "#6b7280"}
-    )
-    fig.update_traces(textposition='top center')
-    fig.update_layout(
-        height=400,
-        xaxis_title="実施工数（小→大）",
-        yaxis_title="期待効果（小→大）",
-        xaxis=dict(range=[0, 6]),
-        yaxis=dict(range=[0, 6])
-    )
-    st.plotly_chart(fig, use_container_width=True)
+            st.markdown(f"""
+            <div class="{card_class}">
+                <p style="margin-bottom: 0.3rem;"><small>{priority_badge}</small></p>
+                <h4 style="margin-top: 0;">{icon} {insight['title']}</h4>
+                <p>{insight['detail']}</p>
+                <p><strong>推奨アクション:</strong> {insight['action']}</p>
+            </div>
+            """, unsafe_allow_html=True)
 
     st.divider()
 
-    # ターゲットリスト出力
+    # ========================================================================
+    # ターゲット顧客リスト（データがある場合のみ表示）
+    # ========================================================================
     st.subheader("ターゲット顧客リストの出力")
 
-    col1, col2 = st.columns(2)
+    # 表示するリストを動的に決定
+    available_lists = []
 
-    with col1:
-        st.markdown("##### 離反リスク顧客リスト")
-        at_risk = rfm_df[rfm_df["segment"] == "離反リスク顧客"][
-            ["customer_id", "last_purchase_date", "frequency", "monetary", "RFM_score"]
-        ]
-        st.dataframe(at_risk, hide_index=True, height=300)
+    # 離反リスク顧客
+    at_risk = rfm_df[rfm_df["segment"] == "離反リスク顧客"] if len(rfm_df) > 0 else pd.DataFrame()
+    if len(at_risk) > 0:
+        available_lists.append(("離反リスク顧客", at_risk, ["customer_id", "last_purchase_date", "frequency", "monetary", "RFM_score"], "at_risk_customers.csv"))
 
-        csv = at_risk.to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            label="CSVダウンロード",
-            data=csv,
-            file_name="at_risk_customers.csv",
-            mime="text/csv"
+    # 高LTV顧客
+    high_ltv = ltv_df[ltv_df["ltv_rank"] == "A（高）"] if len(ltv_df) > 0 else pd.DataFrame()
+    if len(high_ltv) > 0:
+        available_lists.append(("高LTV顧客", high_ltv, ["customer_id", "avg_order_value", "monthly_frequency", "predicted_ltv", "ltv_rank"], "high_ltv_customers.csv"))
+
+    # 休眠顧客
+    dormant = rfm_df[rfm_df["segment"] == "休眠顧客"] if len(rfm_df) > 0 else pd.DataFrame()
+    if len(dormant) > 0:
+        available_lists.append(("休眠顧客", dormant, ["customer_id", "last_purchase_date", "frequency", "monetary", "RFM_score"], "dormant_customers.csv"))
+
+    # アクティブ顧客
+    active = rfm_df[rfm_df["segment"] == "アクティブ顧客"] if len(rfm_df) > 0 else pd.DataFrame()
+    if len(active) > 0:
+        available_lists.append(("アクティブ顧客", active, ["customer_id", "last_purchase_date", "frequency", "monetary", "RFM_score"], "active_customers.csv"))
+
+    # 優良顧客
+    premium = rfm_df[rfm_df["segment"] == "優良顧客"] if len(rfm_df) > 0 else pd.DataFrame()
+    if len(premium) > 0:
+        available_lists.append(("優良顧客", premium, ["customer_id", "last_purchase_date", "frequency", "monetary", "RFM_score"], "premium_customers.csv"))
+
+    if len(available_lists) == 0:
+        st.info("ターゲットリストを生成するためのデータがありません。")
+    else:
+        # 2列で表示（最大4つまで）
+        display_lists = available_lists[:4]
+        cols = st.columns(2)
+
+        for idx, (name, df, columns, filename) in enumerate(display_lists):
+            with cols[idx % 2]:
+                st.markdown(f"##### {name}リスト（{len(df)}名）")
+
+                # 存在するカラムのみ選択
+                display_cols = [c for c in columns if c in df.columns]
+                display_df = df[display_cols].head(50) if len(display_cols) > 0 else df.head(50)
+
+                if "predicted_ltv" in display_df.columns:
+                    display_df = display_df.sort_values("predicted_ltv", ascending=False)
+                elif "monetary" in display_df.columns:
+                    display_df = display_df.sort_values("monetary", ascending=False)
+
+                st.dataframe(display_df, hide_index=True, height=250)
+
+                csv = df[display_cols].to_csv(index=False).encode('utf-8-sig') if len(display_cols) > 0 else df.to_csv(index=False).encode('utf-8-sig')
+                st.download_button(
+                    label=f"📥 CSVダウンロード",
+                    data=csv,
+                    file_name=filename,
+                    mime="text/csv",
+                    key=f"download_{filename}"
+                )
+
+    st.divider()
+
+    # ========================================================================
+    # データに基づく施策サマリー
+    # ========================================================================
+    st.subheader("施策優先度サマリー")
+
+    # 動的に施策リストを生成
+    actions = []
+    total_customers = len(rfm_df) if len(rfm_df) > 0 else 0
+
+    at_risk_count = segment_counts.get("離反リスク顧客", 0)
+    if at_risk_count > 0:
+        actions.append({
+            "施策": f"離反リスク顧客へのリテンションメール（{at_risk_count}名）",
+            "効果": min(5, 2 + at_risk_count // 20),
+            "工数": 2,
+            "優先度": "高" if at_risk_count >= 5 else "中"
+        })
+
+    high_ltv_count = len(high_ltv) if len(ltv_df) > 0 else 0
+    if high_ltv_count > 0:
+        actions.append({
+            "施策": f"高LTV顧客向けVIPプログラム（{high_ltv_count}名）",
+            "効果": 5,
+            "工数": 4,
+            "優先度": "高" if high_ltv_count >= 3 else "中"
+        })
+
+    dormant_count = segment_counts.get("休眠顧客", 0)
+    if dormant_count > 0:
+        actions.append({
+            "施策": f"休眠顧客への復帰キャンペーン（{dormant_count}名）",
+            "効果": min(4, 1 + dormant_count // 10),
+            "工数": 2,
+            "優先度": "中" if dormant_count >= 10 else "低"
+        })
+
+    active_count = segment_counts.get("アクティブ顧客", 0)
+    if active_count > 0:
+        actions.append({
+            "施策": f"アクティブ顧客へのクロスセル（{active_count}名）",
+            "効果": min(4, 2 + active_count // 30),
+            "工数": 3,
+            "優先度": "中"
+        })
+
+    general_count = segment_counts.get("一般顧客", 0)
+    if general_count > 0 and total_customers > 0 and general_count / total_customers >= 0.3:
+        actions.append({
+            "施策": f"一般顧客の育成施策（{general_count}名）",
+            "効果": 3,
+            "工数": 3,
+            "優先度": "中"
+        })
+
+    if len(actions) == 0:
+        st.info("施策を提案するためのデータが不足しています。")
+    else:
+        actions_df = pd.DataFrame(actions)
+
+        fig = px.scatter(
+            actions_df,
+            x="工数",
+            y="効果",
+            size=[40] * len(actions_df),
+            text="施策",
+            color="優先度",
+            color_discrete_map={"高": "#10b981", "中": "#f59e0b", "低": "#6b7280"}
         )
-
-    with col2:
-        st.markdown("##### 高LTV顧客リスト")
-        high_ltv = ltv_df[ltv_df["ltv_rank"] == "A（高）"][
-            ["customer_id", "avg_order_value", "monthly_frequency", "predicted_ltv", "ltv_rank"]
-        ].sort_values("predicted_ltv", ascending=False)
-        st.dataframe(high_ltv, hide_index=True, height=300)
-
-        csv = high_ltv.to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            label="CSVダウンロード",
-            data=csv,
-            file_name="high_ltv_customers.csv",
-            mime="text/csv"
+        fig.update_traces(textposition='top center')
+        fig.update_layout(
+            height=400,
+            xaxis_title="実施工数（小→大）",
+            yaxis_title="期待効果（小→大）",
+            xaxis=dict(range=[0, 6]),
+            yaxis=dict(range=[0, 6])
         )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # 施策一覧テーブル
+        st.markdown("##### 施策一覧")
+        st.dataframe(actions_df, hide_index=True, use_container_width=True)
 
     st.divider()
 
     # 次のステップ
     st.subheader("次のステップ")
     st.markdown("""
-    1. **データ基盤の整備**: 今回特定したデータ品質の問題を、入力時点で防ぐバリデーションルールを導入
-    2. **施策の実行**: 優先度「高」の施策から順に実行し、効果を測定
-    3. **継続的なモニタリング**: このダッシュボードを定期的に更新し、KPIの推移を追跡
-    4. **分析の高度化**: 機械学習モデルによるLTV予測や、商品レコメンデーションの導入を検討
+    1. **上記の優先アクションを実行**: 緊急度の高いものから順に対応
+    2. **ターゲットリストを活用**: CSVをダウンロードしてメール配信システムに取り込み
+    3. **効果測定**: 施策実行後、再度このダッシュボードで効果を確認
+    4. **継続的改善**: データを更新し、PDCAサイクルを回す
     """)
+
+
+def render_data_import_section():
+    """サイドバーのデータインポートセクションを描画"""
+
+    st.markdown("---")
+    st.subheader("📤 自社データを試す")
+
+    # ステップ説明
+    with st.expander("使い方", expanded=False):
+        st.markdown("""
+        **3ステップで自社データを分析:**
+
+        1️⃣ **テンプレートをダウンロード**
+           - 必要なカラム構成を確認
+
+        2️⃣ **データを入力して保存**
+           - Excelで開いてデータ入力
+           - CSV形式で保存
+
+        3️⃣ **ここにアップロード**
+           - 自動でクレンジング・分析実行
+        """)
+
+    # テンプレートダウンロード
+    st.markdown("##### 1. テンプレートダウンロード")
+    template_df = generate_template_csv()
+    csv_template = template_df.to_csv(index=False, encoding='utf-8-sig')
+
+    st.download_button(
+        label="📥 テンプレートCSVをダウンロード",
+        data=csv_template,
+        file_name="ec_data_template.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+    # カラム説明
+    with st.expander("カラム説明を見る"):
+        st.markdown("""
+        **必須カラム（最低限必要）:**
+        | カラム名 | 説明 | 例 |
+        |---------|------|-----|
+        | order_id | 注文ID | O000001 |
+        | order_date | 注文日 | 2024-01-15 |
+        | customer_id | 顧客ID | C00001 |
+        | product_id | 商品ID | P0001 |
+        | category | 商品カテゴリ | 日用品 |
+        | total_amount | 注文金額 | 1000 |
+
+        **オプションカラム（あると分析が充実）:**
+        - customer_name, email, phone, prefecture, age, gender
+        - product_name, price, quantity
+        - payment_method, status
+        """)
+
+    st.markdown("##### 2. CSVファイルをアップロード")
+
+    # ファイルアップローダー
+    uploaded_file = st.file_uploader(
+        "CSVファイルを選択",
+        type=["csv"],
+        help="UTF-8またはShift-JISエンコーディングに対応"
+    )
+
+    return uploaded_file
 
 
 def main():
     """メインアプリケーション"""
     render_header()
 
-    # データ読み込み
-    with st.spinner("データを読み込み・処理中..."):
-        results = load_and_process_data()
-
-    if results is None:
-        st.error("raw_data.csv が見つかりません。先に `python data_gen.py` を実行してください。")
-        st.code("python data_gen.py", language="bash")
-        return
+    # session_stateの初期化
+    if "data_source" not in st.session_state:
+        st.session_state.data_source = "demo"  # "demo" or "uploaded"
+    if "uploaded_data" not in st.session_state:
+        st.session_state.uploaded_data = None
+    if "validation_result" not in st.session_state:
+        st.session_state.validation_result = None
 
     # サイドバー
     with st.sidebar:
+        st.header("データソース")
+
+        # データインポートセクション
+        uploaded_file = render_data_import_section()
+
+        # アップロードされたファイルの処理
+        if uploaded_file is not None:
+            try:
+                # エンコーディングを試行
+                try:
+                    uploaded_df = pd.read_csv(uploaded_file, encoding='utf-8-sig')
+                except UnicodeDecodeError:
+                    uploaded_file.seek(0)
+                    uploaded_df = pd.read_csv(uploaded_file, encoding='shift-jis')
+
+                # バリデーション
+                validation = validate_uploaded_data(uploaded_df)
+                st.session_state.validation_result = validation
+
+                if validation["is_valid"]:
+                    st.session_state.uploaded_data = uploaded_df
+                    st.session_state.data_source = "uploaded"
+                    st.success(f"✅ {len(uploaded_df):,}件のデータを読み込みました")
+
+                    # 警告表示
+                    for warning in validation["warnings"]:
+                        st.warning(warning)
+                else:
+                    st.session_state.uploaded_data = None
+                    # エラー表示
+                    for error in validation["errors"]:
+                        st.error(error)
+
+                    # 不足カラムの詳細表示
+                    if validation["missing_required"]:
+                        st.markdown("**不足している必須カラム:**")
+                        for col in validation["missing_required"]:
+                            st.markdown(f"- `{col}`")
+
+            except Exception as e:
+                st.error(f"ファイルの読み込みに失敗しました: {str(e)}")
+                st.session_state.uploaded_data = None
+
+        st.markdown("---")
+
+        # データソース選択
+        st.markdown("##### 使用するデータ")
+
+        # アップロードデータがある場合は選択可能
+        if st.session_state.uploaded_data is not None:
+            data_source = st.radio(
+                "データソースを選択",
+                ["アップロードデータ", "デモデータ"],
+                index=0 if st.session_state.data_source == "uploaded" else 1,
+                label_visibility="collapsed"
+            )
+            st.session_state.data_source = "uploaded" if data_source == "アップロードデータ" else "demo"
+        else:
+            st.info("📊 デモデータを使用中")
+            st.session_state.data_source = "demo"
+
+        st.markdown("---")
+
+    # データ処理
+    results = None
+
+    if st.session_state.data_source == "uploaded" and st.session_state.uploaded_data is not None:
+        # アップロードデータを処理
+        with st.spinner("アップロードデータを処理中..."):
+            try:
+                results = process_uploaded_data(st.session_state.uploaded_data)
+            except Exception as e:
+                st.error(f"データ処理中にエラーが発生しました: {str(e)}")
+                results = None
+    else:
+        # デモデータを読み込み
+        with st.spinner("デモデータを読み込み・処理中..."):
+            results = load_demo_data()
+
+    if results is None:
+        st.error("データを読み込めませんでした。")
+        st.markdown("""
+        **デモデータを生成するには:**
+        ```bash
+        python data_gen.py
+        ```
+        """)
+        return
+
+    # サイドバーにデータサマリーを表示
+    with st.sidebar:
         st.header("データサマリー")
+
+        # データソース表示
+        if st.session_state.data_source == "uploaded":
+            st.caption("📤 アップロードデータを使用中")
+        else:
+            st.caption("📊 デモデータを使用中")
+
         st.metric("総注文数", f"{len(results['raw_df']):,}")
         st.metric("ユニーク顧客数", f"{results['cleaned_df']['customer_id'].nunique():,}")
         st.metric("商品数", f"{results['cleaned_df']['product_id'].nunique():,}")

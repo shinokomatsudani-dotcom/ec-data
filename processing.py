@@ -21,6 +21,63 @@ except ImportError:
     DUCKDB_AVAILABLE = False
 
 
+def convert_to_numeric(value) -> float:
+    """
+    様々な形式の数値表現を浮動小数点数に変換
+
+    対応形式:
+    - 全角数字: ８９０００ → 89000
+    - 通貨記号: ¥200, 2500円 → 200, 2500
+    - カンマ区切り: 1,000 → 1000
+    - 空白・N/A: → None
+    """
+    if pd.isna(value) or value is None:
+        return None
+
+    # 文字列に変換
+    str_val = str(value).strip()
+
+    # 空文字列、N/A、不明などをNoneに
+    if str_val == "" or str_val.upper() in ["N/A", "NA", "NULL", "不明", "-"]:
+        return None
+
+    # 全角数字を半角に変換
+    fullwidth_to_halfwidth = str.maketrans(
+        '０１２３４５６７８９．，−',
+        '0123456789.,-'
+    )
+    str_val = str_val.translate(fullwidth_to_halfwidth)
+
+    # 通貨記号、単位、不要な文字を削除
+    str_val = re.sub(r'[¥￥円$]', '', str_val)
+    str_val = re.sub(r'歳$', '', str_val)  # 年齢の「歳」
+    str_val = re.sub(r',', '', str_val)    # カンマ区切り
+    str_val = str_val.strip()
+
+    # 数値に変換を試みる
+    try:
+        return float(str_val)
+    except (ValueError, TypeError):
+        return None
+
+
+def safe_numeric_column(df: pd.DataFrame, column: str) -> pd.Series:
+    """
+    DataFrameの列を安全に数値型に変換
+
+    Args:
+        df: DataFrame
+        column: 変換する列名
+
+    Returns:
+        数値型に変換されたSeries
+    """
+    if column not in df.columns:
+        return pd.Series([None] * len(df))
+
+    return df[column].apply(convert_to_numeric)
+
+
 class ProcessingLog:
     """処理ログを保持するクラス"""
 
@@ -116,9 +173,12 @@ def standardize_payment_method(method: str) -> str:
         "クレカ": "クレジットカード",
         "credit card": "クレジットカード",
         "銀行振込": "銀行振込",
+        "振り込み": "銀行振込",
         "代金引換": "代金引換",
+        "代引き": "代金引換",
         "コンビニ払い": "コンビニ払い",
         "paypay": "電子マネー",
+        "ペイペイ": "電子マネー",
     }
 
     for key, value in mapping.items():
@@ -126,6 +186,53 @@ def standardize_payment_method(method: str) -> str:
             return value
 
     return "その他"
+
+
+def standardize_category(category: str) -> str:
+    """
+    商品カテゴリの表記揺れを統一
+
+    対応パターン:
+    - ひらがな/カタカナ/漢字の表記揺れ
+    - 英語表記
+    - 全角スペースや余分な空白
+    """
+    if pd.isna(category) or category is None:
+        return "その他"
+
+    # 前処理: 空白除去、小文字化
+    cat = str(category).strip()
+    cat_lower = cat.lower()
+    # 全角スペースも除去
+    cat_normalized = cat.replace("　", "").replace(" ", "").lower()
+
+    # カテゴリマッピング（キーワードベース）
+    # 優先度順に定義（より具体的なものを先に）
+    category_mappings = [
+        # 食品系
+        (["食品", "しょくひん", "食料", "フード", "food"], "食品"),
+
+        # 日用品系
+        (["日用品", "にちようひん", "日用雑貨", "生活用品", "生活雑貨", "daily"], "日用品"),
+
+        # 家電系
+        (["家電", "かでん", "電化製品", "電気製品", "electronics", "電機"], "家電"),
+
+        # 衣類系
+        (["衣類", "いるい", "衣料", "ファッション", "アパレル", "服", "fashion", "clothing"], "衣類"),
+
+        # 美容系
+        (["美容", "びよう", "コスメ", "化粧", "beauty", "cosmetic"], "美容"),
+    ]
+
+    # マッチングを試行
+    for keywords, standard_name in category_mappings:
+        for keyword in keywords:
+            if keyword in cat_normalized:
+                return standard_name
+
+    # マッチしない場合は元の値をそのまま返す（ただし空白は整形）
+    return cat.strip()
 
 
 def clean_data(df: pd.DataFrame, log: ProcessingLog) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -189,11 +296,27 @@ def clean_data(df: pd.DataFrame, log: ProcessingLog) -> Tuple[pd.DataFrame, pd.D
         })
 
     # -------------------------------------------------------------------------
+    # Step 3.5: カテゴリ名の統一
+    # -------------------------------------------------------------------------
+    if "category" in cleaned_df.columns:
+        original_categories = cleaned_df["category"].nunique()
+        # カテゴリ統一前の値を保存（デバッグ用）
+        original_cat_values = cleaned_df["category"].value_counts().to_dict()
+        cleaned_df["category"] = cleaned_df["category"].apply(standardize_category)
+        new_categories = cleaned_df["category"].nunique()
+        log.add("カテゴリ統一", "表記揺れを統一", {
+            "統一前カテゴリ数": int(original_categories),
+            "統一後カテゴリ数": int(new_categories),
+            "統一後の分布": cleaned_df["category"].value_counts().to_dict(),
+            "SQL相当": "UPDATE orders SET category = CASE WHEN category IN ('食品', '食料品', 'しょくひん', 'フード') THEN '食品' ... END"
+        })
+
+    # -------------------------------------------------------------------------
     # Step 4: 数量の異常値処理
     # -------------------------------------------------------------------------
     if "quantity" in cleaned_df.columns:
-        # 数値に変換
-        cleaned_df["quantity"] = pd.to_numeric(cleaned_df["quantity"], errors="coerce")
+        # 数値に変換（全角数字、通貨記号などに対応）
+        cleaned_df["quantity"] = safe_numeric_column(cleaned_df, "quantity")
 
         # 異常値をフラグ（負の値、0、極端に大きい値）
         invalid_qty_mask = (
@@ -205,8 +328,11 @@ def clean_data(df: pd.DataFrame, log: ProcessingLog) -> Tuple[pd.DataFrame, pd.D
 
         invalid_qty_count = invalid_qty_mask.sum()
 
+        # 中央値を計算（有効な値がない場合は1をデフォルトに）
+        valid_qty = cleaned_df.loc[~invalid_qty_mask, "quantity"]
+        median_qty = valid_qty.median() if len(valid_qty) > 0 else 1.0
+
         # 異常値を中央値で補完
-        median_qty = cleaned_df.loc[~invalid_qty_mask, "quantity"].median()
         cleaned_df.loc[invalid_qty_mask, "quantity"] = median_qty
 
         log.add("数量クレンジング", "異常値を中央値で補完", {
@@ -219,23 +345,43 @@ def clean_data(df: pd.DataFrame, log: ProcessingLog) -> Tuple[pd.DataFrame, pd.D
     # Step 5: 金額の異常値処理
     # -------------------------------------------------------------------------
     if "total_amount" in cleaned_df.columns:
-        cleaned_df["total_amount"] = pd.to_numeric(cleaned_df["total_amount"], errors="coerce")
+        # 数値に変換（全角数字、通貨記号などに対応）
+        cleaned_df["total_amount"] = safe_numeric_column(cleaned_df, "total_amount")
+
+        # priceも数値に変換（再計算用）
+        if "price" in cleaned_df.columns:
+            cleaned_df["price"] = safe_numeric_column(cleaned_df, "price")
 
         # 外れ値フラグ（100万円以上）
-        outlier_mask = cleaned_df["total_amount"] >= 1000000
+        outlier_mask = cleaned_df["total_amount"].notna() & (cleaned_df["total_amount"] >= 1000000)
         flagged_df.loc[outlier_mask, "flag_outlier_amount"] = True
 
         # 負の値フラグ
-        negative_mask = cleaned_df["total_amount"] < 0
+        negative_mask = cleaned_df["total_amount"].notna() & (cleaned_df["total_amount"] < 0)
         flagged_df.loc[negative_mask, "flag_negative_value"] = True
 
         # 負の値とNullを補完（price * quantityで再計算）
-        invalid_amount_mask = cleaned_df["total_amount"].isna() | (cleaned_df["total_amount"] < 0)
-        if "price" in cleaned_df.columns:
-            cleaned_df.loc[invalid_amount_mask, "total_amount"] = (
-                cleaned_df.loc[invalid_amount_mask, "price"] *
-                cleaned_df.loc[invalid_amount_mask, "quantity"]
+        invalid_amount_mask = cleaned_df["total_amount"].isna() | (cleaned_df["total_amount"] <= 0)
+        if "price" in cleaned_df.columns and "quantity" in cleaned_df.columns:
+            # 両方が数値の場合のみ再計算
+            can_recalc_mask = (
+                invalid_amount_mask &
+                cleaned_df["price"].notna() &
+                cleaned_df["quantity"].notna() &
+                (cleaned_df["price"] > 0) &
+                (cleaned_df["quantity"] > 0)
             )
+            cleaned_df.loc[can_recalc_mask, "total_amount"] = (
+                cleaned_df.loc[can_recalc_mask, "price"] *
+                cleaned_df.loc[can_recalc_mask, "quantity"]
+            )
+
+        # それでもNullの場合は中央値で補完
+        still_invalid = cleaned_df["total_amount"].isna() | (cleaned_df["total_amount"] <= 0)
+        valid_amounts = cleaned_df.loc[~still_invalid, "total_amount"]
+        if len(valid_amounts) > 0:
+            median_amount = valid_amounts.median()
+            cleaned_df.loc[still_invalid, "total_amount"] = median_amount
 
         log.add("金額クレンジング", "異常値をフラグ、欠損を再計算", {
             "外れ値件数（100万以上）": int(outlier_mask.sum()),
@@ -266,10 +412,13 @@ def clean_data(df: pd.DataFrame, log: ProcessingLog) -> Tuple[pd.DataFrame, pd.D
     # -------------------------------------------------------------------------
     fill_summary = {}
 
-    # 年齢: 中央値で補完
+    # 年齢: 数値変換して中央値で補完
     if "age" in cleaned_df.columns:
+        # 数値に変換（全角数字、「歳」などに対応）
+        cleaned_df["age"] = safe_numeric_column(cleaned_df, "age")
         age_null_count = cleaned_df["age"].isna().sum()
-        median_age = cleaned_df["age"].median()
+        valid_ages = cleaned_df["age"].dropna()
+        median_age = valid_ages.median() if len(valid_ages) > 0 else 35.0
         cleaned_df["age"] = cleaned_df["age"].fillna(median_age)
         fill_summary["age"] = {"欠損数": int(age_null_count), "補完値": float(median_age)}
 
@@ -330,7 +479,15 @@ def calculate_rfm(df: pd.DataFrame, log: ProcessingLog,
         (df["total_amount"] > 0)
     ].copy()
 
-    valid_df["order_date"] = pd.to_datetime(valid_df["order_date"])
+    valid_df["order_date"] = pd.to_datetime(valid_df["order_date"], errors="coerce")
+
+    # 有効なデータがない場合は空のDataFrameを返す
+    if len(valid_df) == 0:
+        log.add("RFM分析", "分析スキップ", {"理由": "有効なデータがありません"})
+        return pd.DataFrame(columns=[
+            "customer_id", "last_purchase_date", "frequency", "monetary",
+            "recency", "R_score", "F_score", "M_score", "RFM_score", "segment"
+        ])
 
     # 顧客ごとに集計
     rfm_df = valid_df.groupby("customer_id").agg({
@@ -345,13 +502,29 @@ def calculate_rfm(df: pd.DataFrame, log: ProcessingLog,
     rfm_df["recency"] = (analysis_dt - rfm_df["last_purchase_date"]).dt.days
 
     # RFMスコア（1-5の5段階）
-    rfm_df["R_score"] = pd.qcut(rfm_df["recency"], q=5, labels=[5, 4, 3, 2, 1], duplicates="drop")
-    rfm_df["F_score"] = pd.qcut(rfm_df["frequency"].rank(method="first"), q=5, labels=[1, 2, 3, 4, 5], duplicates="drop")
-    rfm_df["M_score"] = pd.qcut(rfm_df["monetary"].rank(method="first"), q=5, labels=[1, 2, 3, 4, 5], duplicates="drop")
+    # データ数が少ない場合はqcut()が失敗するため、エラーハンドリングを追加
+    def safe_qcut(series, q, labels, ascending=True):
+        """安全にqcutを実行（データ数が少ない場合に対応）"""
+        try:
+            if len(series.unique()) < q:
+                # ユニーク値が少ない場合は、利用可能な分位数で分割
+                n_bins = min(len(series.unique()), q)
+                if n_bins <= 1:
+                    return pd.Series([labels[len(labels)//2]] * len(series), index=series.index)
+                adjusted_labels = labels[:n_bins] if ascending else labels[-n_bins:]
+                return pd.qcut(series.rank(method="first"), q=n_bins, labels=adjusted_labels, duplicates="drop")
+            return pd.qcut(series.rank(method="first") if not ascending else series, q=q, labels=labels, duplicates="drop")
+        except (ValueError, IndexError):
+            # それでも失敗した場合は中央値を返す
+            return pd.Series([labels[len(labels)//2]] * len(series), index=series.index)
+
+    rfm_df["R_score"] = safe_qcut(rfm_df["recency"], q=5, labels=[5, 4, 3, 2, 1], ascending=False)
+    rfm_df["F_score"] = safe_qcut(rfm_df["frequency"], q=5, labels=[1, 2, 3, 4, 5], ascending=True)
+    rfm_df["M_score"] = safe_qcut(rfm_df["monetary"], q=5, labels=[1, 2, 3, 4, 5], ascending=True)
 
     # RFMスコアを数値に変換
     for col in ["R_score", "F_score", "M_score"]:
-        rfm_df[col] = rfm_df[col].astype(int)
+        rfm_df[col] = pd.to_numeric(rfm_df[col], errors="coerce").fillna(3).astype(int)
 
     # 総合スコア
     rfm_df["RFM_score"] = rfm_df["R_score"] + rfm_df["F_score"] + rfm_df["M_score"]
@@ -422,15 +595,38 @@ def calculate_first_purchase_repeat_rate(df: pd.DataFrame, log: ProcessingLog) -
         df["product_id"].notna()
     ].copy()
 
-    valid_df["order_date"] = pd.to_datetime(valid_df["order_date"])
+    valid_df["order_date"] = pd.to_datetime(valid_df["order_date"], errors="coerce")
+
+    # 有効なデータがない場合は空の結果を返す
+    if len(valid_df) == 0:
+        log.add("リピート率分析", "分析スキップ", {"理由": "有効なデータがありません"})
+        return {
+            "customer_analysis": pd.DataFrame(columns=["customer_id", "first_product_id", "first_product_name", "first_category", "total_purchases", "is_repeater"]),
+            "category_repeat": pd.DataFrame(columns=["first_category", "total_customers", "repeaters", "repeat_rate"]),
+            "product_repeat": pd.DataFrame(columns=["product_id", "product_name", "total_customers", "repeaters", "repeat_rate"])
+        }
 
     # 顧客ごとの注文を日付順にソート
     valid_df = valid_df.sort_values(["customer_id", "order_date"])
 
     # 初回購入商品を特定
     first_purchases = valid_df.groupby("customer_id").first().reset_index()
-    first_purchases = first_purchases[["customer_id", "product_id", "product_name", "category"]]
-    first_purchases.columns = ["customer_id", "first_product_id", "first_product_name", "first_category"]
+
+    # 必要なカラムを選択（存在しない場合はデフォルト値）
+    cols_to_select = ["customer_id", "product_id"]
+    first_purchases_data = {"customer_id": first_purchases["customer_id"], "first_product_id": first_purchases["product_id"]}
+
+    if "product_name" in first_purchases.columns:
+        first_purchases_data["first_product_name"] = first_purchases["product_name"]
+    else:
+        first_purchases_data["first_product_name"] = "不明"
+
+    if "category" in first_purchases.columns:
+        first_purchases_data["first_category"] = first_purchases["category"]
+    else:
+        first_purchases_data["first_category"] = "不明"
+
+    first_purchases = pd.DataFrame(first_purchases_data)
 
     # 顧客ごとの総購入回数
     purchase_counts = valid_df.groupby("customer_id")["order_id"].count().reset_index()
@@ -508,7 +704,16 @@ def calculate_ltv(df: pd.DataFrame, log: ProcessingLog,
         (df["total_amount"] > 0)
     ].copy()
 
-    valid_df["order_date"] = pd.to_datetime(valid_df["order_date"])
+    valid_df["order_date"] = pd.to_datetime(valid_df["order_date"], errors="coerce")
+
+    # 有効なデータがない場合は空のDataFrameを返す
+    if len(valid_df) == 0:
+        log.add("LTV予測", "分析スキップ", {"理由": "有効なデータがありません"})
+        return pd.DataFrame(columns=[
+            "customer_id", "first_purchase", "last_purchase", "total_spent",
+            "avg_order_value", "order_count", "active_months", "monthly_frequency",
+            "predicted_ltv", "ltv_rank"
+        ])
 
     # 顧客ごとの集計
     customer_stats = valid_df.groupby("customer_id").agg({
@@ -575,49 +780,168 @@ def generate_insights(df: pd.DataFrame, rfm_df: pd.DataFrame,
                       repeat_analysis: dict, ltv_df: pd.DataFrame,
                       log: ProcessingLog) -> List[Dict[str, Any]]:
     """
-    分析結果からビジネスインサイトを生成
+    分析結果からビジネスインサイトを動的に生成
+
+    データの特性に応じて、関連性の高いインサイトのみを生成する
     """
     insights = []
+    total_customers = len(rfm_df) if len(rfm_df) > 0 else 1
 
-    # インサイト1: 高リピート率カテゴリ
-    top_repeat_category = repeat_analysis["category_repeat"].iloc[0]
-    insights.append({
-        "title": f"「{top_repeat_category['first_category']}」購入者のリピート率が最も高い",
-        "detail": f"初回購入が{top_repeat_category['first_category']}カテゴリの顧客は、{top_repeat_category['repeat_rate']}%がリピーターになっています。",
-        "action": f"新規顧客には{top_repeat_category['first_category']}カテゴリの商品を初回購入として推奨することで、リピート率向上が期待できます。",
-        "type": "opportunity"
+    # セグメント別の顧客数を取得
+    segment_counts = rfm_df["segment"].value_counts().to_dict() if len(rfm_df) > 0 else {}
+
+    # ========================================================================
+    # 優先度1: 緊急アクションが必要なインサイト（警告）
+    # ========================================================================
+
+    # 離反リスク顧客（5%以上かつ5名以上の場合のみ表示）
+    at_risk_count = segment_counts.get("離反リスク顧客", 0)
+    at_risk_pct = at_risk_count / total_customers * 100
+    if at_risk_count >= 5 and at_risk_pct >= 5:
+        insights.append({
+            "title": f"離反リスク顧客が{at_risk_count}名（{at_risk_pct:.1f}%）",
+            "detail": f"以前は頻繁に購入していたが最近購入がない顧客です。放置すると完全離脱の可能性があります。",
+            "action": "【優先度：高】リテンションメール（クーポン付き）を送信し、購入を促してください。",
+            "type": "warning",
+            "priority": 1,
+            "impact_score": at_risk_count * 10  # インパクトスコア
+        })
+
+    # ========================================================================
+    # 優先度2: 成長機会のインサイト
+    # ========================================================================
+
+    # 高リピート率カテゴリ（データがある場合のみ）
+    category_repeat = repeat_analysis.get("category_repeat", pd.DataFrame())
+    if len(category_repeat) > 0:
+        # 顧客数が10名以上のカテゴリのみ対象
+        significant_categories = category_repeat[category_repeat["total_customers"] >= 10]
+        if len(significant_categories) > 0:
+            top_cat = significant_categories.iloc[0]
+            # 全体平均リピート率を計算
+            overall_repeat = repeat_analysis["customer_analysis"]["is_repeater"].mean() * 100 if len(repeat_analysis.get("customer_analysis", [])) > 0 else 0
+            if top_cat["repeat_rate"] > overall_repeat:
+                insights.append({
+                    "title": f"「{top_cat['first_category']}」購入者のリピート率が{top_cat['repeat_rate']:.1f}%",
+                    "detail": f"このカテゴリの初回購入者は全体平均（{overall_repeat:.1f}%）より高いリピート率を示しています。",
+                    "action": f"新規顧客獲得キャンペーンで「{top_cat['first_category']}」を推奨商品として訴求してください。",
+                    "type": "opportunity",
+                    "priority": 2,
+                    "impact_score": top_cat["total_customers"] * (top_cat["repeat_rate"] - overall_repeat) / 10
+                })
+
+    # 高LTV顧客（存在する場合のみ）
+    if len(ltv_df) > 0:
+        high_ltv = ltv_df[ltv_df["ltv_rank"] == "A（高）"]
+        if len(high_ltv) >= 3:
+            avg_high_ltv = high_ltv["predicted_ltv"].mean()
+            insights.append({
+                "title": f"高LTV顧客{len(high_ltv)}名（平均¥{avg_high_ltv:,.0f}）",
+                "detail": f"上位顧客は今後12ヶ月で大きな売上貢献が見込まれます。",
+                "action": "VIPプログラム（限定セール先行案内、ポイント還元率UP）で囲い込みを強化してください。",
+                "type": "opportunity",
+                "priority": 2,
+                "impact_score": len(high_ltv) * avg_high_ltv / 100000
+            })
+
+    # アクティブ顧客が多い場合（ポジティブなインサイト）
+    active_count = segment_counts.get("アクティブ顧客", 0)
+    active_pct = active_count / total_customers * 100
+    if active_count >= 10 and active_pct >= 20:
+        insights.append({
+            "title": f"アクティブ顧客が{active_count}名（{active_pct:.1f}%）",
+            "detail": f"最近も購入しており、継続利用している健全な顧客層です。",
+            "action": "クロスセル施策（関連商品レコメンド）で客単価向上を狙ってください。",
+            "type": "opportunity",
+            "priority": 3,
+            "impact_score": active_count * 5
+        })
+
+    # ========================================================================
+    # 優先度3: 改善余地のあるインサイト
+    # ========================================================================
+
+    # 休眠顧客（10名以上かつ10%以上の場合のみ）
+    dormant_count = segment_counts.get("休眠顧客", 0)
+    dormant_pct = dormant_count / total_customers * 100
+    if dormant_count >= 10 and dormant_pct >= 10:
+        insights.append({
+            "title": f"休眠顧客{dormant_count}名（{dormant_pct:.1f}%）の再活性化余地",
+            "detail": f"過去に購入履歴があるが、長期間購入のない顧客です。",
+            "action": "「お久しぶりキャンペーン」（特別割引コード）で復帰を促してください。",
+            "type": "opportunity",
+            "priority": 3,
+            "impact_score": dormant_count * 3
+        })
+
+    # 高額購入顧客（スポット購入者）が多い場合
+    high_value_count = segment_counts.get("高額購入顧客", 0)
+    high_value_pct = high_value_count / total_customers * 100
+    if high_value_count >= 5 and high_value_pct >= 5:
+        insights.append({
+            "title": f"高額スポット購入者{high_value_count}名（{high_value_pct:.1f}%）",
+            "detail": f"購入頻度は低いが、購入時の金額が高い顧客層です。",
+            "action": "購入後フォローメール（使い方ガイド、関連商品）で継続購入を促進してください。",
+            "type": "opportunity",
+            "priority": 3,
+            "impact_score": high_value_count * 8
+        })
+
+    # 一般顧客が大半を占める場合
+    general_count = segment_counts.get("一般顧客", 0)
+    general_pct = general_count / total_customers * 100
+    if general_pct >= 40:
+        insights.append({
+            "title": f"一般顧客が{general_pct:.1f}%を占めている",
+            "detail": f"特定セグメントに分類されない顧客が多く、育成余地があります。",
+            "action": "購入頻度向上キャンペーン（リピート購入で割引）を検討してください。",
+            "type": "opportunity",
+            "priority": 4,
+            "impact_score": general_count * 2
+        })
+
+    # ========================================================================
+    # 優先度4: 低リピート率カテゴリの改善
+    # ========================================================================
+    if len(category_repeat) > 0:
+        low_repeat_cats = category_repeat[
+            (category_repeat["total_customers"] >= 10) &
+            (category_repeat["repeat_rate"] < 50)
+        ]
+        if len(low_repeat_cats) > 0:
+            worst_cat = low_repeat_cats.iloc[-1]
+            insights.append({
+                "title": f"「{worst_cat['first_category']}」のリピート率が{worst_cat['repeat_rate']:.1f}%と低い",
+                "detail": f"このカテゴリの初回購入者はリピーターになりにくい傾向があります。",
+                "action": f"初回購入後のフォローアップ（関連商品提案、使用レビュー依頼）を強化してください。",
+                "type": "warning",
+                "priority": 4,
+                "impact_score": worst_cat["total_customers"] * (50 - worst_cat["repeat_rate"]) / 10
+            })
+
+    # ========================================================================
+    # インサイトがない場合のフォールバック
+    # ========================================================================
+    if len(insights) == 0:
+        insights.append({
+            "title": "データ量が少なく、明確なインサイトを抽出できません",
+            "detail": "より多くの注文データを蓄積することで、詳細な分析が可能になります。",
+            "action": "継続的なデータ収集を行い、再度分析を実施してください。",
+            "type": "info",
+            "priority": 5,
+            "impact_score": 0
+        })
+
+    # 優先度（昇順：1が最優先）→インパクトスコア（降順）でソート
+    insights = sorted(insights, key=lambda x: (x.get("priority", 5), -x.get("impact_score", 0)))
+
+    # 上位5件に制限
+    insights = insights[:5]
+
+    log.add("インサイト生成", "生成完了", {
+        "インサイト数": len(insights),
+        "セグメント分布": segment_counts
     })
-
-    # インサイト2: 離反リスク顧客
-    at_risk_count = len(rfm_df[rfm_df["segment"] == "離反リスク顧客"])
-    at_risk_pct = at_risk_count / len(rfm_df) * 100
-    insights.append({
-        "title": f"離反リスク顧客が{at_risk_pct:.1f}%存在",
-        "detail": f"{at_risk_count}名の顧客が「以前は頻繁に購入していたが、最近購入がない」状態です。",
-        "action": "これらの顧客に対してリテンションキャンペーン（クーポン配布、おすすめ商品メール）を実施することを推奨します。",
-        "type": "warning"
-    })
-
-    # インサイト3: 高LTV顧客の特徴
-    high_ltv = ltv_df[ltv_df["ltv_rank"] == "A（高）"]
-    avg_high_ltv = high_ltv["predicted_ltv"].mean()
-    insights.append({
-        "title": f"上位20%の顧客の予測LTVは平均¥{avg_high_ltv:,.0f}",
-        "detail": f"高LTV顧客{len(high_ltv)}名が、今後12ヶ月で平均¥{avg_high_ltv:,.0f}の売上貢献が見込まれます。",
-        "action": "VIP顧客向けの特別プログラム（限定セール先行案内、ポイント還元率アップ）の導入を検討してください。",
-        "type": "opportunity"
-    })
-
-    # インサイト4: 休眠顧客の再活性化
-    dormant_count = len(rfm_df[rfm_df["segment"] == "休眠顧客"])
-    insights.append({
-        "title": f"休眠顧客{dormant_count}名の再活性化ポテンシャル",
-        "detail": f"過去に購入履歴があるが、長期間購入のない顧客が{dormant_count}名います。",
-        "action": "「お久しぶりキャンペーン」として、特別割引コードの配布を検討してください。",
-        "type": "opportunity"
-    })
-
-    log.add("インサイト生成", "生成完了", {"インサイト数": len(insights)})
 
     return insights
 

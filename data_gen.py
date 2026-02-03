@@ -345,6 +345,76 @@ def generate_data_summary(df: pd.DataFrame) -> dict:
     return summary
 
 
+def generate_template_csv() -> pd.DataFrame:
+    """
+    分析に必要なカラム構成を持つテンプレートCSVを生成
+
+    Returns:
+        pd.DataFrame: サンプル1-2行を含むテンプレート
+    """
+    # 必須カラムとサンプルデータ
+    template_data = {
+        "order_id": ["O000001", "O000002"],
+        "order_date": ["2024-01-15", "2024-02-20"],
+        "customer_id": ["C00001", "C00002"],
+        "customer_name": ["山田 太郎", "鈴木 花子"],
+        "email": ["yamada@example.com", "suzuki@example.com"],
+        "phone": ["090-1234-5678", "080-9876-5432"],
+        "prefecture": ["東京都", "大阪府"],
+        "age": [35, 28],
+        "gender": ["M", "F"],
+        "product_id": ["P0001", "P0002"],
+        "product_name": ["洗剤", "シャンプー"],
+        "category": ["日用品", "日用品"],
+        "price": [500, 800],
+        "quantity": [2, 1],
+        "total_amount": [1000, 800],
+        "payment_method": ["クレジットカード", "PayPay"],
+        "status": ["delivered", "delivered"],
+    }
+
+    return pd.DataFrame(template_data)
+
+
+def get_required_columns() -> list:
+    """
+    分析に必須のカラムリストを返す
+
+    Returns:
+        list: 必須カラム名のリスト
+    """
+    return [
+        "order_id",
+        "order_date",
+        "customer_id",
+        "product_id",
+        "category",
+        "total_amount",
+    ]
+
+
+def get_optional_columns() -> list:
+    """
+    分析でオプションとして使用するカラムリストを返す
+
+    Returns:
+        list: オプションカラム名のリスト
+    """
+    return [
+        "customer_name",
+        "email",
+        "phone",
+        "prefecture",
+        "age",
+        "gender",
+        "product_name",
+        "price",
+        "quantity",
+        "payment_method",
+        "status",
+    ]
+
+
 def main():
     """
     メイン実行関数
