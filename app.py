@@ -701,6 +701,11 @@ def render_action_tab(results: dict):
     if len(dormant) > 0:
         available_lists.append(("休眠顧客", dormant, ["customer_id", "last_purchase_date", "frequency", "monetary", "RFM_score"], "dormant_customers.csv"))
 
+    # 高額購入顧客
+    high_value = rfm_df[rfm_df["segment"] == "高額購入顧客"] if len(rfm_df) > 0 else pd.DataFrame()
+    if len(high_value) > 0:
+        available_lists.append(("高額購入顧客", high_value, ["customer_id", "last_purchase_date", "frequency", "monetary", "RFM_score"], "high_value_customers.csv"))
+
     # アクティブ顧客
     active = rfm_df[rfm_df["segment"] == "アクティブ顧客"] if len(rfm_df) > 0 else pd.DataFrame()
     if len(active) > 0:
@@ -778,6 +783,15 @@ def render_action_tab(results: dict):
             "効果": min(4, 1 + dormant_count // 10),
             "工数": 2,
             "優先度": "中" if dormant_count >= 10 else "低"
+        })
+
+    high_value_count = segment_counts.get("高額購入顧客", 0)
+    if high_value_count > 0:
+        actions.append({
+            "施策": f"高額購入顧客へのプレミアムサービス案内（{high_value_count}名）",
+            "効果": 5,
+            "工数": 2,
+            "優先度": "高" if high_value_count >= 3 else "中"
         })
 
     active_count = segment_counts.get("アクティブ顧客", 0)

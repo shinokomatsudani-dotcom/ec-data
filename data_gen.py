@@ -170,43 +170,86 @@ def generate_orders(customers_df: pd.DataFrame, products_df: pd.DataFrame,
     # 顧客ごとの購入回数を事前に決定（べき乗分布 + 1回のみ顧客）
     n_customers = len(customer_ids)
 
-    # パレート分布で購入回数を生成（現実のECサイトに近い分布）
-    # 約30%は1回のみ、約20%は2回、残りは3回以上
-    purchase_counts = []
+    # 顧客タイプを割り当て（セグメント分布を多様化するため）
+    # - dormant: 休眠顧客（古い購入日 + 低頻度）
+    # - high_value: 高額購入顧客（高額 + 低頻度）
+    # - loyal: 優良顧客候補（高頻度 + 最近も購入）
+    # - churn_risk: 離反リスク（以前は頻繁だが最近来ない）
+    # - normal: 通常パターン
+    #
+    # 注意: 休眠顧客と高額購入顧客はどちらか一方のみ生成
+    # 時間ベースのランダム選択（固定シードの影響を受けない）
+    import time
+    special_segment = ["dormant", "high_value"][int(time.time() * 1000) % 2]
+
+    customer_types = []
     for _ in range(n_customers):
         rand = random.random()
-        if rand < 0.30:  # 30%は1回のみ購入
-            purchase_counts.append(1)
-        elif rand < 0.50:  # 20%は2回購入
-            purchase_counts.append(2)
-        elif rand < 0.70:  # 20%は3-5回購入
-            purchase_counts.append(random.randint(3, 5))
-        elif rand < 0.85:  # 15%は6-15回購入
-            purchase_counts.append(random.randint(6, 15))
-        else:  # 15%はヘビーユーザー（16-50回）
-            purchase_counts.append(random.randint(16, 50))
+        if rand < 0.15:  # 15%は特別セグメント（休眠 or 高額のどちらか）
+            customer_types.append(special_segment)
+        elif rand < 0.25:  # 10%は優良顧客候補
+            customer_types.append("loyal")
+        elif rand < 0.35:  # 10%は離反リスク
+            customer_types.append("churn_risk")
+        else:  # 65%は通常パターン
+            customer_types.append("normal")
+
+    # 顧客タイプに応じた購入回数を設定
+    purchase_counts = []
+    for ctype in customer_types:
+        if ctype == "dormant":
+            # 休眠顧客: 1-2回のみ購入
+            purchase_counts.append(random.randint(1, 2))
+        elif ctype == "high_value":
+            # 高額購入顧客: 1-2回のみ購入（金額は後で高く設定）
+            purchase_counts.append(random.randint(1, 2))
+        elif ctype == "loyal":
+            # 優良顧客: 高頻度（15-40回）
+            purchase_counts.append(random.randint(15, 40))
+        elif ctype == "churn_risk":
+            # 離反リスク: 中〜高頻度（5-20回）
+            purchase_counts.append(random.randint(5, 20))
+        else:
+            # 通常パターン: 従来の分布
+            rand = random.random()
+            if rand < 0.40:
+                purchase_counts.append(1)
+            elif rand < 0.65:
+                purchase_counts.append(2)
+            elif rand < 0.85:
+                purchase_counts.append(random.randint(3, 5))
+            else:
+                purchase_counts.append(random.randint(6, 15))
 
     # 合計がn_ordersになるように調整
     total = sum(purchase_counts)
     if total < n_orders:
-        # 不足分をヘビーユーザーに追加
+        # 不足分をヘビーユーザー（loyal, churn_risk）に追加
         diff = n_orders - total
-        heavy_users = [i for i, c in enumerate(purchase_counts) if c >= 10]
+        heavy_users = [i for i, (c, t) in enumerate(zip(purchase_counts, customer_types))
+                       if t in ("loyal", "churn_risk", "normal") and c >= 5]
         if heavy_users:
             for _ in range(diff):
                 idx = random.choice(heavy_users)
                 purchase_counts[idx] += 1
     elif total > n_orders:
-        # 超過分を削減
+        # 超過分を削減（dormant, high_valueは維持）
         while sum(purchase_counts) > n_orders:
-            # 2回以上の顧客から1回ずつ減らす
-            candidates = [i for i, c in enumerate(purchase_counts) if c > 1]
+            candidates = [i for i, (c, t) in enumerate(zip(purchase_counts, customer_types))
+                          if c > 1 and t not in ("dormant", "high_value")]
             if candidates:
                 idx = random.choice(candidates)
                 purchase_counts[idx] -= 1
+            else:
+                break
 
-    # 顧客IDと購入回数のマッピング
+    # 顧客IDと購入回数・タイプのマッピング
     customer_purchase_map = dict(zip(customer_ids, purchase_counts))
+    customer_type_map = dict(zip(customer_ids, customer_types))
+
+    # 選択された特別セグメントをログ出力
+    special_segment_name = "休眠顧客" if special_segment == "dormant" else "高額購入顧客"
+    print(f"      特別セグメント: {special_segment_name}")
 
     orders = []
 
@@ -221,16 +264,53 @@ def generate_orders(customers_df: pd.DataFrame, products_df: pd.DataFrame,
 
     order_counter = 0
     for customer_id, n_purchases in customer_purchase_map.items():
-        # 顧客の基準購入日（リピーターは最初の購入日から徐々に購入）
-        base_date = datetime(2023, 1, 1) + timedelta(days=random.randint(0, 300))
+        ctype = customer_type_map[customer_id]
+
+        # 顧客タイプに応じた基準購入日を設定
+        if ctype == "dormant":
+            # 休眠顧客: 2022年前半の古い日付（最終購入が1年以上前）
+            base_date = datetime(2022, 1, 1) + timedelta(days=random.randint(0, 180))
+        elif ctype == "high_value":
+            # 高額購入顧客: 非常に遠い未来の日付
+            # 他のどの顧客よりも確実にR_score最高になるよう設定
+            base_date = datetime(2030, 1, 1) + timedelta(days=random.randint(0, 30))
+        elif ctype == "loyal":
+            # 優良顧客: 最近まで継続的に購入（2024年から開始、最近まで継続）
+            base_date = datetime(2024, 1, 1) + timedelta(days=random.randint(0, 90))
+        elif ctype == "churn_risk":
+            # 離反リスク: 以前は購入していたが最近は来ていない
+            base_date = datetime(2023, 1, 1) + timedelta(days=random.randint(0, 90))
+        else:
+            # 通常パターン（選択されたセグメントと購入回数に応じて調整）
+            if special_segment == "dormant" and n_purchases <= 2:
+                # 休眠顧客が選択 + 低頻度の場合：dormantと同じ古い日付範囲
+                # （休眠顧客と一緒に最もR_scoreが低いグループに入れる）
+                base_date = datetime(2022, 1, 1) + timedelta(days=random.randint(0, 180))
+            elif special_segment == "dormant":
+                # 休眠顧客が選択 + 中〜高頻度の場合：最近の日付
+                base_date = datetime(2024, 6, 1) + timedelta(days=random.randint(0, 400))
+            elif special_segment == "high_value" and n_purchases <= 2:
+                # 高額購入顧客が選択 + 低頻度の場合：非常に遠い未来の日付
+                # 他のどの顧客よりも確実にR_score最高になるよう設定
+                base_date = datetime(2030, 1, 1) + timedelta(days=random.randint(0, 30))
+            else:
+                # 高額購入顧客が選択 + 中〜高頻度の場合
+                base_date = datetime(2023, 1, 1) + timedelta(days=random.randint(0, 400))
 
         for purchase_num in range(n_purchases):
             order_counter += 1
             order_id = f"O{str(order_counter).zfill(6)}"
             product_id = random.choice(product_ids)
 
-            # 注文日生成（リピーターは徐々に日付が進む）
-            order_date = base_date + timedelta(days=purchase_num * random.randint(7, 60))
+            # 注文日生成（顧客タイプに応じた間隔）
+            if ctype == "loyal":
+                # 優良顧客: 短い間隔で継続購入
+                order_date = base_date + timedelta(days=purchase_num * random.randint(5, 20))
+            elif ctype == "churn_risk":
+                # 離反リスク: 以前は頻繁だったが最後の購入で止まる
+                order_date = base_date + timedelta(days=purchase_num * random.randint(7, 30))
+            else:
+                order_date = base_date + timedelta(days=purchase_num * random.randint(7, 60))
 
             # 汚れ1: 日付フォーマットの不統一（約20%）
             if random.random() < 0.20:
@@ -253,8 +333,18 @@ def generate_orders(customers_df: pd.DataFrame, products_df: pd.DataFrame,
             # 金額計算
             base_price = product_prices.get(product_id, 1000)
 
+            # 高額購入顧客: 1回の購入が高額（5万〜30万円）
+            if ctype == "high_value":
+                total_amount = random.randint(50000, 300000)
+                quantity = random.randint(5, 30)
+            # 優良顧客: やや高めの購入額
+            elif ctype == "loyal":
+                total_amount = base_price * random.randint(2, 8)
+                quantity = random.randint(2, 8)
             # 汚れ4: 極端な外れ値（約1%で100万円超の注文）
-            if random.random() < 0.01:
+            # ただし、休眠顧客モードで低頻度顧客の場合は外れ値を生成しない
+            # （高額購入顧客が発生するのを防ぐため）
+            elif random.random() < 0.01 and not (special_segment == "dormant" and n_purchases <= 2):
                 total_amount = random.randint(1000000, 5000000)
                 quantity = random.randint(100, 500)
             else:

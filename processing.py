@@ -506,19 +506,19 @@ def calculate_rfm(df: pd.DataFrame, log: ProcessingLog,
     def safe_qcut(series, q, labels, ascending=True):
         """安全にqcutを実行（データ数が少ない場合に対応）"""
         try:
-            if len(series.unique()) < q:
-                # ユニーク値が少ない場合は、利用可能な分位数で分割
-                n_bins = min(len(series.unique()), q)
-                if n_bins <= 1:
-                    return pd.Series([labels[len(labels)//2]] * len(series), index=series.index)
-                adjusted_labels = labels[:n_bins] if ascending else labels[-n_bins:]
-                return pd.qcut(series.rank(method="first"), q=n_bins, labels=adjusted_labels, duplicates="drop")
-            return pd.qcut(series.rank(method="first") if not ascending else series, q=q, labels=labels, duplicates="drop")
+            # 常にrankを使用して重複値を処理
+            ranked = series.rank(method="first", ascending=ascending)
+            return pd.qcut(ranked, q=q, labels=labels, duplicates="drop")
         except (ValueError, IndexError):
-            # それでも失敗した場合は中央値を返す
-            return pd.Series([labels[len(labels)//2]] * len(series), index=series.index)
+            # 失敗した場合はパーセンタイルベースで手動割り当て
+            try:
+                percentiles = series.rank(pct=True, ascending=ascending)
+                result = pd.cut(percentiles, bins=q, labels=labels, include_lowest=True)
+                return result.fillna(labels[len(labels)//2])
+            except:
+                return pd.Series([labels[len(labels)//2]] * len(series), index=series.index)
 
-    rfm_df["R_score"] = safe_qcut(rfm_df["recency"], q=5, labels=[5, 4, 3, 2, 1], ascending=False)
+    rfm_df["R_score"] = safe_qcut(rfm_df["recency"], q=5, labels=[1, 2, 3, 4, 5], ascending=False)
     rfm_df["F_score"] = safe_qcut(rfm_df["frequency"], q=5, labels=[1, 2, 3, 4, 5], ascending=True)
     rfm_df["M_score"] = safe_qcut(rfm_df["monetary"], q=5, labels=[1, 2, 3, 4, 5], ascending=True)
 
