@@ -267,35 +267,37 @@ def generate_orders(customers_df: pd.DataFrame, products_df: pd.DataFrame,
         ctype = customer_type_map[customer_id]
 
         # 顧客タイプに応じた基準購入日を設定
+        # 分析日は2026年2月4日を想定。すべての日付は過去に設定する。
         if ctype == "dormant":
-            # 休眠顧客: 2022年前半の古い日付（最終購入が1年以上前）
+            # 休眠顧客: 2022年前半の古い日付（最終購入が約4年前）
             base_date = datetime(2022, 1, 1) + timedelta(days=random.randint(0, 180))
         elif ctype == "high_value":
-            # 高額購入顧客: 非常に遠い未来の日付
-            # 他のどの顧客よりも確実にR_score最高になるよう設定
-            base_date = datetime(2030, 1, 1) + timedelta(days=random.randint(0, 30))
+            # 高額購入顧客: 2026年1月（分析日直前、recency約30日）
+            base_date = datetime(2026, 1, 1) + timedelta(days=random.randint(0, 30))
         elif ctype == "loyal":
-            # 優良顧客: 最近まで継続的に購入（2024年から開始、最近まで継続）
-            base_date = datetime(2024, 1, 1) + timedelta(days=random.randint(0, 90))
+            if special_segment == "high_value":
+                # 高額購入顧客モード: loyalは2023年開始（低頻度顧客より古くなるよう）
+                base_date = datetime(2023, 1, 1) + timedelta(days=random.randint(0, 90))
+            else:
+                # 休眠顧客モード: loyalは2024年開始
+                base_date = datetime(2024, 1, 1) + timedelta(days=random.randint(0, 90))
         elif ctype == "churn_risk":
-            # 離反リスク: 以前は購入していたが最近は来ていない
+            # 離反リスク: 2023年前半
             base_date = datetime(2023, 1, 1) + timedelta(days=random.randint(0, 90))
         else:
             # 通常パターン（選択されたセグメントと購入回数に応じて調整）
             if special_segment == "dormant" and n_purchases <= 2:
                 # 休眠顧客が選択 + 低頻度の場合：dormantと同じ古い日付範囲
-                # （休眠顧客と一緒に最もR_scoreが低いグループに入れる）
                 base_date = datetime(2022, 1, 1) + timedelta(days=random.randint(0, 180))
             elif special_segment == "dormant":
-                # 休眠顧客が選択 + 中〜高頻度の場合：最近の日付
-                base_date = datetime(2024, 6, 1) + timedelta(days=random.randint(0, 400))
+                # 休眠顧客が選択 + 中〜高頻度の場合：2024年開始
+                base_date = datetime(2024, 1, 1) + timedelta(days=random.randint(0, 180))
             elif special_segment == "high_value" and n_purchases <= 2:
-                # 高額購入顧客が選択 + 低頻度の場合：非常に遠い未来の日付
-                # 他のどの顧客よりも確実にR_score最高になるよう設定
-                base_date = datetime(2030, 1, 1) + timedelta(days=random.randint(0, 30))
+                # 高額購入顧客が選択 + 低頻度の場合：2026年1月（最も最近）
+                base_date = datetime(2026, 1, 1) + timedelta(days=random.randint(0, 30))
             else:
-                # 高額購入顧客が選択 + 中〜高頻度の場合
-                base_date = datetime(2023, 1, 1) + timedelta(days=random.randint(0, 400))
+                # 高額購入顧客が選択 + 中〜高頻度の場合：2023年
+                base_date = datetime(2023, 1, 1) + timedelta(days=random.randint(0, 300))
 
         for purchase_num in range(n_purchases):
             order_counter += 1
@@ -303,14 +305,20 @@ def generate_orders(customers_df: pd.DataFrame, products_df: pd.DataFrame,
             product_id = random.choice(product_ids)
 
             # 注文日生成（顧客タイプに応じた間隔）
+            # 分析日は2026年2月4日。すべての日付がこれより前になるよう設定
+            analysis_date = datetime(2026, 2, 4)
+            max_date = analysis_date - timedelta(days=7)  # 分析日の1週間前を上限
+
             if ctype == "loyal":
-                # 優良顧客: 短い間隔で継続購入
-                order_date = base_date + timedelta(days=purchase_num * random.randint(5, 20))
+                order_date = base_date + timedelta(days=purchase_num * random.randint(5, 15))
             elif ctype == "churn_risk":
-                # 離反リスク: 以前は頻繁だったが最後の購入で止まる
-                order_date = base_date + timedelta(days=purchase_num * random.randint(7, 30))
+                order_date = base_date + timedelta(days=purchase_num * random.randint(7, 20))
             else:
-                order_date = base_date + timedelta(days=purchase_num * random.randint(7, 60))
+                order_date = base_date + timedelta(days=purchase_num * random.randint(7, 30))
+
+            # 日付が上限を超えたら上限に収める
+            if order_date > max_date:
+                order_date = max_date - timedelta(days=random.randint(0, 30))
 
             # 汚れ1: 日付フォーマットの不統一（約20%）
             if random.random() < 0.20:
